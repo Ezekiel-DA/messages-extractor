@@ -138,11 +138,9 @@ async function main () {
 
   console.log('Reading keybag from manifest...')
   let keybag = await readKeybag(dirs[0])
-  // console.log(keybag)
 
   console.log('Constructing passkey...')
   let passkey = await constructPasskey(password, keybag)
-  // console.log(passkey)
 
   console.log('Unwraping keys in keybag...')
   let userKey = await importKWKey(passkey)
@@ -155,7 +153,6 @@ async function main () {
       keyClass.KEY = unwrappedKey
     })
   }))
-  // console.log(keybag)
 
   console.log('Decrypting database...')
   let manifest = await readManifestKey(dirs[0])
@@ -166,7 +163,6 @@ async function main () {
   let dbfile = await writeTmpFile('Manifest.db', decryptAESCBC(unwrappedManifestKey, rawDB))
   let db = await sqlite.open(dbfile)
   let res = await db.get('SELECT fileID, domain, relativePath, file from Files where relativePath LIKE ? ORDER BY relativePath', fileToExtract)
-  // console.log(res)
 
   if (!res.fileID) {
     console.log(`requested file ${fileToExtract} was not found in Manifest.db; check syntax and drop ~/ if present.`)
@@ -174,7 +170,6 @@ async function main () {
   }
 
   let contents = await readFileById(dirs[0], res.fileID)
-  // console.log(contents)
 
   let fileInfo = (await bplist.parseBuffer(res.file))[0]
   let fileData = fileInfo['$objects'][fileInfo['$top'].root.UID]
@@ -184,12 +179,10 @@ async function main () {
   let fileUnwrapKey = await importKWKey(keybag.classes[protectionClasses[protectionClass]].KEY)
   let unwrappedFileKey = await unwrapKey(wrappedFileKey, fileUnwrapKey)
   // let f = await writeTmpFile('sms.db', decryptAESCBC(unwrappedFileKey, contents).slice(0, fileData.Size)) // this should truncate the decrypted contents to the right length but appears to break things ?
-  // let outputFilename = await writeTmpFile(path.basename(fileToExtract), decryptAESCBC(unwrappedFileKey, contents))
-  // console.log(outputFilename)
   await writefile(path.basename(fileToExtract), decryptAESCBC(unwrappedFileKey, contents))
   
   await db.close()
-  //await unlink(dbfile)
+  await unlink(dbfile)
 }
 
 main()
