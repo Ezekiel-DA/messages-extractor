@@ -21,7 +21,7 @@ const protectionClasses = ['Unused',
 const classKeyTypes = ['CLAS', 'WRAP', 'WPKY', 'KTYP', 'PBKY', 'UUID']
 
 // promisify some commonly used native APIs
-const [pbkdf2, readdir, writefile, unlink, parseplistFile] = [crypto.pbkdf2, fs.readdir, fs.writeFile, fs.unlink, bplist.parseFile].map(promisify)
+const [pbkdf2, readdir, unlink, parseplistFile] = [crypto.pbkdf2, fs.readdir, fs.unlink, bplist.parseFile].map(promisify)
 
 async function readManifestPlist (backupDir) {
   return parseplistFile(path.join(backupPath, backupDir, 'Manifest.plist'))
@@ -178,26 +178,17 @@ async function main () {
   await writeOutFileStream(path.basename(smsDatabaseFilename), decryptedContents)
 
   const query = `
-  SELECT 
-  DATETIME(date/1000000000 + 978307200, 'unixepoch', 'localtime') as date, 
-  h.id as number, m.service as service,
-  CASE is_from_me 
-    WHEN 0 THEN "Received" 
-    WHEN 1 THEN "Sent" 
-    ELSE "Unknown" 
-  END as type,
-  text as text,
-  CASE cache_has_attachments
-  WHEN 1 THEN a.filename
-  ELSE NULL
-  END as attachedFile
-FROM message AS m
-LEFT OUTER JOIN handle AS h ON h.rowid = m.handle_id
-LEFT OUTER JOIN message_attachment_join AS maj ON maj.message_id = m.rowid
-LEFT OUTER JOIN attachment AS a ON a.rowid = maj.attachment_id
-WHERE h.id = ?
-ORDER BY m.rowid ASC;
-`
+  SELECT DATETIME(date/1000000000 + 978307200, 'unixepoch', 'localtime') AS date, 
+  h.id AS number, m.service AS service,
+  CASE is_from_me WHEN 0 THEN "Received" WHEN 1 THEN "Sent" ELSE "Unknown" END AS type,
+  text AS text,
+  CASE cache_has_attachments WHEN 1 THEN a.filename ELSE NULL END AS attachedFile
+  FROM message AS m
+  LEFT OUTER JOIN handle AS h ON h.rowid = m.handle_id
+  LEFT OUTER JOIN message_attachment_join AS maj ON maj.message_id = m.rowid
+  LEFT OUTER JOIN attachment AS a ON a.rowid = maj.attachment_id
+  WHERE h.id = ?
+  ORDER BY m.rowid ASC;`
 
   console.log('Dumping SMS database contents...')
   let smsdb = await sqlite.open(path.basename(smsDatabaseFilename))
