@@ -9,6 +9,7 @@ const sqlite = require('sqlite')
 const uuidv4 = require('uuid/v4')
 
 const backupPath = path.join(process.env.APPDATA, 'Apple Computer/MobileSync/Backup')
+const smsDatabaseFilename = 'Library/SMS/sms.db'
 
 const protectionClasses = ['Unused',
 'NSFileProtectionComplete', 'NSFileProtectionCompleteUnlessOpen', 'NSFileProtectionCompleteUntilFirstUserAuthentication',
@@ -20,44 +21,33 @@ const protectionClasses = ['Unused',
 const classKeyTypes = ['CLAS', 'WRAP', 'WPKY', 'KTYP', 'PBKY', 'UUID']
 
 // promisify some commonly used native APIs
-const [pbkdf2, readdir, readfile, writefile, unlink, parseplistFile] = [crypto.pbkdf2, fs.readdir, fs.readFile, fs.writeFile, fs.unlink, bplist.parseFile].map(promisify)
+const [pbkdf2, readdir, writefile, unlink, parseplistFile] = [crypto.pbkdf2, fs.readdir, fs.writeFile, fs.unlink, bplist.parseFile].map(promisify)
 
-/**
- * Read the raw (encrypted) contents of a file in the backup, returning a Buffer
- * @param {String} filename - the file to process in the backup directory
- * @param {String} backupDir - the backup directory
- */
-async function readRawFileFromBackup (filename, backupDir) {
-  return readfile(path.join(backupPath, backupDir, filename))
-}
-
-async function readFileById (backupDir, fileid) {
-  return readfile(path.join(backupPath, backupDir, fileid.slice(0, 2), fileid))
-}
-
-async function readManifest (backupDir) {
+async function readManifestPlist (backupDir) {
   return parseplistFile(path.join(backupPath, backupDir, 'Manifest.plist'))
 }
 
 /**
- * Writes a file to the temporary directory with the given contents, returning a Promise for the actual (unique) full filepath.
- * File paths are made unique by prepending a UUID to them.
+ * Writes a file with the contents of a given stream, returning a Promise once the write has completed.
+ * If necessary (i.e. when writing out temp files) file paths are made unique by prepending a UUID to the filename.
  * @param {String} filename
- * @param {Buffer} contents
+ * @param {Stream} contentStream
+ * @param {Boolean} tempFile - if true, make the filename unique and write out to the temp directory; otherwise, write out to CWD with the original filename
+ * @returns {String} the path of the written file (absolute if temp, relative if not. Yes, this sucks)
  */
-async function writeTmpFile (filename, contents) {
-  let uuid = uuidv4()
-  let uniqueFilename = path.join(process.env.TMPDIR || process.env.TMP || process.env.TEMP, uuid + '-' + filename)
-  return writefile(uniqueFilename, contents)
-  .then(() => uniqueFilename)
+async function writeOutFileStream (filename, contentStream, tempFile) {
+  if (tempFile) {
+    filename = path.join(process.env.TMPDIR || process.env.TMP || process.env.TEMP, uuidv4() + '-' + filename)
+  }
+  return new Promise(resolve => { contentStream.pipe(fs.createWriteStream(filename).on('finish', () => resolve(filename))) })
 }
 
 /**
  * Extract the manifest key from Manifest.plist and return it's class and wrapped key (to be unwrapped)
- * @param {*} backupDir
+ * @param {String} backupDir
  */
 async function readManifestKey (backupDir) {
-  let manifest = (await readManifest(backupDir))[0].ManifestKey
+  let manifest = (await readManifestPlist(backupDir))[0].ManifestKey
   let keyClass = manifest.readInt32LE()
   let wrappedKey = manifest.slice(4)
   return {keyClass, wrappedKey}
@@ -65,7 +55,7 @@ async function readManifestKey (backupDir) {
 
 /**
  * Import a Key Wrapping key (in the RFC3394 sense)
- * @param {*} key - the raw unwrapping key
+ * @param {String} key - the raw unwrapping key
  */
 async function importKWKey (key) {
   return webcrypto.subtle.importKey('raw', key, {name: 'AES-KW'}, false, ['wrapKey', 'unwrapKey'])
@@ -82,7 +72,7 @@ async function unwrapKey (wrappedKey, unwrappingKey) {
 }
 
 async function readKeybag (backupDir) {
-  let manifest = await readManifest(backupDir)
+  let manifest = await readManifestPlist(backupDir)
   let keybag = manifest[0]['BackupKeyBag']
 
   let bagData = {}
@@ -119,70 +109,108 @@ async function constructPasskey (password, keybag) {
 }
 
 /**
- * Decrypt some data through AES256 in CBC mode. Assumes 0 IV, returns a Buffer of the decrypted data.
+ * Decrypt some data through AES256 in CBC mode. Assumes 0 IV.
  * @param {Buffer} unwrappedKey - the unwrapped key to use
- * @param {Buffer} data - a buffer of the data to decrypt
+ * @param {Stream} dataStream - a readable Stream of the data to decrypt
+ * @returns {Crypto.Decipher} a readable Stream of the decrypted data
  */
-function decryptAESCBC (unwrappedKey, data) {
+function decryptAESCBC (unwrappedKey, dataStream) {
   let dbDecrypter = crypto.createDecipheriv('aes-256-cbc', unwrappedKey, new Buffer(16))
-  return Buffer.concat([dbDecrypter.update(data), dbDecrypter.final()])
+  return dataStream.pipe(dbDecrypter)
 }
 
-async function main () {
-  const [, , password, fileToExtract] = process.argv
+/**
+ * Decrypt a file from the backup.
+ * @param {String} backupDir - the root of the given backup
+ * @param {String} filename - the name of the file in the iOS filesystem
+ * @param {Object} keybag  - the keybag to use
+ * @param {Database} manifestDb - the SQLite3 DB opened from a decrypted manifest.db file
+ * @returns {Crypto.Decipher} a Stream that can be read to get the decrypted contents of the requested file
+ */
+async function decryptFile (backupDir, filename, keybag, manifestDb) {
+  filename = filename.replace(/~\//, '')
+  let fileDbEntry = await manifestDb.get('SELECT fileID, domain, relativePath, file from Files where relativePath LIKE ? ORDER BY relativePath', filename)
 
-  console.log(`Searching for backups in ${backupPath}`)
+  if (!fileDbEntry || !fileDbEntry.fileID) { throw new Error(`requested file ${filename} was not found in Manifest.db; check syntax and drop ~/ if present.`) }
 
-  let dirs = await readdir(backupPath)
-  console.log(`Found backups: ${dirs}`)
+  let contentsStream = await fs.createReadStream(path.join(backupPath, backupDir, fileDbEntry.fileID.slice(0, 2), fileDbEntry.fileID))
 
-  console.log('Reading keybag from manifest...')
-  let keybag = await readKeybag(dirs[0])
-
-  console.log('Constructing passkey...')
-  let passkey = await constructPasskey(password, keybag)
-
-  console.log('Unwraping keys in keybag...')
-  let userKey = await importKWKey(passkey)
-  let keyUnwrapping = await Promise.all(Object.values(keybag.classes).map(keyClass => {
-    if (keyClass.WRAP !== 2) {
-      return Promise.resolve('unhandled wrap type')
-    }
-    return unwrapKey(keyClass.WPKY, userKey)
-    .then(unwrappedKey => {
-      keyClass.KEY = unwrappedKey
-    })
-  }))
-
-  console.log('Decrypting database...')
-  let manifest = await readManifestKey(dirs[0])
-  let manifestUnwrapKey = await importKWKey(keybag.classes[protectionClasses[manifest.keyClass]].KEY)
-  let unwrappedManifestKey = await unwrapKey(manifest.wrappedKey, manifestUnwrapKey)
-
-  let rawDB = await readRawFileFromBackup('Manifest.db', dirs[0])
-  let dbfile = await writeTmpFile('Manifest.db', decryptAESCBC(unwrappedManifestKey, rawDB))
-  let db = await sqlite.open(dbfile)
-  let res = await db.get('SELECT fileID, domain, relativePath, file from Files where relativePath LIKE ? ORDER BY relativePath', fileToExtract)
-
-  if (!res.fileID) {
-    console.log(`requested file ${fileToExtract} was not found in Manifest.db; check syntax and drop ~/ if present.`)
-    process.exit(1)
-  }
-
-  let contents = await readFileById(dirs[0], res.fileID)
-
-  let fileInfo = (await bplist.parseBuffer(res.file))[0]
+  let fileInfo = (await bplist.parseBuffer(fileDbEntry.file))[0]
   let fileData = fileInfo['$objects'][fileInfo['$top'].root.UID]
   let protectionClass = fileData.ProtectionClass
   let wrappedFileKey = fileInfo['$objects'][fileData.EncryptionKey.UID]['NS.data'].slice(4)
 
   let fileUnwrapKey = await importKWKey(keybag.classes[protectionClasses[protectionClass]].KEY)
   let unwrappedFileKey = await unwrapKey(wrappedFileKey, fileUnwrapKey)
-  // let f = await writeTmpFile('sms.db', decryptAESCBC(unwrappedFileKey, contents).slice(0, fileData.Size)) // this should truncate the decrypted contents to the right length but appears to break things ?
-  await writefile(path.basename(fileToExtract), decryptAESCBC(unwrappedFileKey, contents))
+  return decryptAESCBC(unwrappedFileKey, contentsStream)
+}
+
+async function main () {
+  const [, , password, phoneNumber] = process.argv
+
+  let dirs = await readdir(backupPath)
+  let backupDir = dirs[0]
+  console.log(`Found backups: ${dirs} in ${backupPath}; using ${backupDir}`)
   
-  await db.close()
-  await unlink(dbfile)
+  // read the keybag from the manifest plist
+  let keybag = await readKeybag(backupDir)
+
+  // construct a passkey from the input password (slow)
+  console.log('Constructing passkey...')
+  let passkey = await importKWKey(await constructPasskey(password, keybag))
+
+  // unwrap all the keys in the keybag with the passkey
+  await Promise.all(Object.values(keybag.classes)
+    .filter(keyClass => keyClass.WRAP === 2) // we only know how to handle / care about this wrap type
+    .map(keyClass => unwrapKey(keyClass.WPKY, passkey).then(unwrappedKey => { keyClass.KEY = unwrappedKey }))
+  )
+
+  // decrypt the database of per file keys (manifest.db) with the info from manifest.plist decrypted with the passkey,
+  // write it to disk and open it as SQLite file (there doesn't seem to be a way to open it as a stream instead of having to write it out)
+  let manifest = await readManifestKey(backupDir)
+  let unwrappedManifestKey = await unwrapKey(manifest.wrappedKey, await importKWKey(keybag.classes[protectionClasses[manifest.keyClass]].KEY))
+  let manifestReadStream = fs.createReadStream(path.join(backupPath, backupDir, 'Manifest.db'))
+  let manifestDbFile = await writeOutFileStream('Manifest.db', decryptAESCBC(unwrappedManifestKey, manifestReadStream), true)
+  let manifestDb = await sqlite.open(manifestDbFile)
+
+  console.log('Decrypting SMS database file...')
+  let decryptedContents = await decryptFile(backupDir, smsDatabaseFilename, keybag, manifestDb)
+  await writeOutFileStream(path.basename(smsDatabaseFilename), decryptedContents)
+
+  const query = `
+  SELECT 
+  DATETIME(date/1000000000 + 978307200, 'unixepoch', 'localtime') as date, 
+  h.id as number, m.service as service,
+  CASE is_from_me 
+    WHEN 0 THEN "Received" 
+    WHEN 1 THEN "Sent" 
+    ELSE "Unknown" 
+  END as type,
+  text as text,
+  CASE cache_has_attachments
+  WHEN 1 THEN a.filename
+  ELSE NULL
+  END as attachedFile
+FROM message AS m
+LEFT OUTER JOIN handle AS h ON h.rowid = m.handle_id
+LEFT OUTER JOIN message_attachment_join AS maj ON maj.message_id = m.rowid
+LEFT OUTER JOIN attachment AS a ON a.rowid = maj.attachment_id
+WHERE h.id = ?
+ORDER BY m.rowid ASC;
+`
+
+  console.log('Dumping SMS database contents...')
+  let smsdb = await sqlite.open(path.basename(smsDatabaseFilename))
+  let smsList = await smsdb.all(query, phoneNumber)
+
+  let attachedFiles = await Promise.all(smsList.filter(sms => sms.attachedFile).map(sms => {
+    return decryptFile(backupDir, sms.attachedFile, keybag, manifestDb).then(contentStream => ({contentStream, filename: sms.attachedFile}))
+  }))
+  await Promise.all(attachedFiles.map(attachedFile => writeOutFileStream(path.basename(attachedFile.filename), attachedFile.contentStream)))
+
+  await manifestDb.close()
+  await smsdb.close()
+  await unlink(manifestDbFile)
 }
 
 main()
