@@ -7,6 +7,7 @@ const { promisify } = require('util')
 const bplist = require('bplist-parser')
 const sqlite = require('sqlite')
 const uuidv4 = require('uuid/v4')
+const PDFDocument = require('pdfkit')
 
 const backupPath = path.join(process.env.APPDATA, 'Apple Computer/MobileSync/Backup')
 const smsDatabaseFilename = 'Library/SMS/sms.db'
@@ -145,13 +146,27 @@ async function decryptFile (backupDir, filename, keybag, manifestDb) {
   return decryptAESCBC(unwrappedFileKey, contentsStream)
 }
 
+/**
+ * Dump all attachements from a list of SMS
+ * @param {String} backupDir
+ * @param {Object} keybag
+ * @param {Database} manifestDb
+ * @param {Object[]} smsList - the complete results of a DB query of the right format against the SMS database
+ */
+async function dumpSMSAttachments (backupDir, keybag, manifestDb, smsList) {
+  let attachedFiles = await Promise.all(smsList.filter(sms => sms.attachedFile).map(sms => {
+    return decryptFile(backupDir, sms.attachedFile, keybag, manifestDb).then(contentStream => ({contentStream, filename: sms.attachedFile}))
+  }))
+  return Promise.all(attachedFiles.map(attachedFile => writeOutFileStream(path.basename(attachedFile.filename), attachedFile.contentStream)))
+}
+
 async function main () {
   const [, , password, phoneNumber] = process.argv
 
   let dirs = await readdir(backupPath)
   let backupDir = dirs[0]
   console.log(`Found backups: ${dirs} in ${backupPath}; using ${backupDir}`)
-  
+
   // read the keybag from the manifest plist
   let keybag = await readKeybag(backupDir)
 
@@ -194,10 +209,44 @@ async function main () {
   let smsdb = await sqlite.open(path.basename(smsDatabaseFilename))
   let smsList = await smsdb.all(query, phoneNumber)
 
-  let attachedFiles = await Promise.all(smsList.filter(sms => sms.attachedFile).map(sms => {
-    return decryptFile(backupDir, sms.attachedFile, keybag, manifestDb).then(contentStream => ({contentStream, filename: sms.attachedFile}))
-  }))
-  await Promise.all(attachedFiles.map(attachedFile => writeOutFileStream(path.basename(attachedFile.filename), attachedFile.contentStream)))
+  await dumpSMSAttachments(backupDir, keybag, manifestDb, smsList)
+
+  let outputPdfFile = fs.createWriteStream('test.pdf')
+  let pdfDoc = new PDFDocument()
+  pdfDoc.pipe(outputPdfFile)
+
+  pdfDoc.font('Helvetica')
+
+  //const allowedFiletypes = ['.gif', '.png', '.jpg', '.jpeg', '.bmp']
+  const allowedFiletypes = ['.png', '.jpg', '.jpeg']
+
+  var lastType = 'Received'
+  smsList.map(sms => {
+    let me = sms.type === 'Received'
+    let options = {align: me  ? 'right' : 'left'}
+    pdfDoc.fillColor(me ? 'blue' : 'black')
+    if (sms.attachedFile) {
+      if (allowedFiletypes.includes(path.extname(sms.attachedFile).toLowerCase())) {
+        return pdfDoc.image(path.basename(sms.attachedFile), {align: options.align, fit: [200, 200]})
+      }
+      else {
+        return pdfDoc.text(`<attachment format not yet supported for ${path.basename(sms.attachedFile)}`, options)
+      }
+    }
+    // if (sms.text === '\uFFFC') { // U+FFFC = 'OBJECT REPLACEMENT CHARACTER', i.e. an attachment only message
+    //   return pdfDoc.text('<attachments not yet supported>', options)
+    // }
+    pdfDoc.text(sms.text, options)
+    if (lastType === sms.type) {
+      pdfDoc.moveDown()
+    }
+    else {
+      lastType = sms.type
+      pdfDoc.moveDown(3)
+    }
+    
+  })
+  pdfDoc.end()
 
   await manifestDb.close()
   await smsdb.close()
